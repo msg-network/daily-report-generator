@@ -1,0 +1,13 @@
+FROM public.ecr.aws/lambda/python:3.13
+
+RUN pip install poetry && poetry config virtualenvs.create false
+
+COPY pyproject.toml poetry.lock ./
+RUN poetry install --no-root --only main
+
+COPY main.py ./
+COPY routers/ ./routers/
+COPY services/ ./services/
+COPY schemas/ ./schemas/
+
+CMD ["main.handler"]

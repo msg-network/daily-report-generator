@@ -1,0 +1,44 @@
+# docs templates
+/docs/templates/
+
+# .env files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# .DS_Store
+.DS_Store
+
+# .idea
+.idea
+
+# .vscode
+.vscode
+
+# .pytest_cache
+.pytest_cache
+
+# .ruff_cache
+.ruff_cache
+
+# node_modules
+node_modules
+
+# Python
+__pycache__
+*.pyc
+.venv
+
+# Next.js
+.next
+out
+
+# Backend templates (contains actual reports)
+backend/templates/*.docx
+
+# CDK
+infra/cdk.out/
+infra/cdk.context.json
+**/cdk.out/
