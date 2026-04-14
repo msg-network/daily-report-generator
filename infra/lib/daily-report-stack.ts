@@ -3,6 +3,7 @@ import * as apigateway from "aws-cdk-lib/aws-apigateway";
 import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
 import * as iam from "aws-cdk-lib/aws-iam";
+import * as ecr_assets from "aws-cdk-lib/aws-ecr-assets";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
@@ -48,8 +49,10 @@ export class DailyReportStack extends cdk.Stack {
 					path.join(__dirname, "../../backend"),
 					{
 						file: "Dockerfile.lambda",
+						platform: ecr_assets.Platform.LINUX_ARM64,
 					},
 				),
+				architecture: lambda.Architecture.ARM_64,
 				memorySize: 512,
 				timeout: cdk.Duration.seconds(30),
 				environment: {
@@ -77,6 +80,7 @@ export class DailyReportStack extends cdk.Stack {
 		// ========================================
 		const api = new apigateway.RestApi(this, "BackendApi", {
 			restApiName: "DailyReportAPI",
+			binaryMediaTypes: ["*/*"],
 			defaultCorsPreflightOptions: {
 				allowOrigins: apigateway.Cors.ALL_ORIGINS,
 				allowMethods: apigateway.Cors.ALL_METHODS,

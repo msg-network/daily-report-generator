@@ -1,13 +1,11 @@
 FROM public.ecr.aws/lambda/python:3.13
 
-RUN pip install poetry && poetry config virtualenvs.create false
+COPY requirements.txt ${LAMBDA_TASK_ROOT}/
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt -t ${LAMBDA_TASK_ROOT}
 
-COPY pyproject.toml poetry.lock ./
-RUN poetry install --no-root --only main
-
-COPY main.py ./
-COPY routers/ ./routers/
-COPY services/ ./services/
-COPY schemas/ ./schemas/
+COPY main.py ${LAMBDA_TASK_ROOT}/
+COPY routers/ ${LAMBDA_TASK_ROOT}/routers/
+COPY services/ ${LAMBDA_TASK_ROOT}/services/
+COPY schemas/ ${LAMBDA_TASK_ROOT}/schemas/
 
 CMD ["main.handler"]
