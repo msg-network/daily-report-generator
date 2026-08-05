@@ -63,11 +63,19 @@ def post_json(url: str, payload: dict, headers: dict) -> tuple[int, bytes]:
     h = {"Content-Type": "application/json"}
     h.update(headers)
     req = urllib.request.Request(url, data=body, headers=h, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            return r.status, r.read()
-    except urllib.error.HTTPError as e:
-        return e.code, e.read()
+    # スリープ解除直後などネットワーク未復帰のことがあるため、接続系エラーはリトライする
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+        except urllib.error.URLError as e:
+            if attempt == 3:
+                raise
+            log(f"接続エラー（{e.reason}）。30秒後にリトライ ({attempt + 1}/3)")
+            time.sleep(30)
+    raise RuntimeError("unreachable")
 
 
 def parse_date_args(args: list[str]) -> list[str]:
