@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
 
-from routers import generate, parse
+from routers import from_commits, generate, parse
 
 app = FastAPI(title="Daily Report Generator API")
 
@@ -20,6 +20,7 @@ app.add_middleware(
 
 app.include_router(parse.router, prefix="/api")
 app.include_router(generate.router, prefix="/api")
+app.include_router(from_commits.router, prefix="/api")
 
 
 @app.get("/api/health")
