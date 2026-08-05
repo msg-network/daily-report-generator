@@ -28,10 +28,26 @@ GITHUB_API = "https://api.github.com"
 UA = "daily-report-generator/1.0"
 DEFAULT_TIMEOUT = 10
 
+# 「1日」の境界時刻 (JST)。深夜3〜4時までの作業を前日の日報に含めるため、
+# 日付 D のコミット集計範囲は [D 05:00, D+1 05:00) とする
+DAY_START_HOUR = 5
+
+# コミット集計対象のリポジトリオーナー（自動発見の対象）
+REPO_OWNERS = {"msg-network", "msg-network-org"}
+
+
+def day_window(date_iso: str) -> tuple[datetime, datetime]:
+    """日付 D の集計範囲 [D 05:00 JST, D+1 05:00 JST) を返す。"""
+    day = datetime.fromisoformat(date_iso).date()
+    start = datetime(day.year, day.month, day.day, DAY_START_HOUR, 0, 0, tzinfo=JST)
+    return start, start + timedelta(days=1)
+
 # デフォルト対象リポジトリ（2026-07 の活動実績ベース）
+# ※ msg-app / msg-native-app は org へ移管済み（旧 msg-network/* URL はリダイレクト
+#   されるため、旧名で登録すると同じコミットが二重取得される。org 名のみ登録すること）
 DEFAULT_REPOS: list[str] = [
-    "msg-network/msg-native-app",
-    "msg-network/msg-app",
+    "msg-network-org/msg-native-app",
+    "msg-network-org/msg-app",
     "msg-network/msg-app-terms",
     "msg-network/daily-report-generator",
     "msg-network/attendance-monitor",
@@ -62,6 +78,14 @@ def _get_logins() -> set[str]:
     return {s.strip() for s in raw.split(",") if s.strip()}
 
 
+class GitHubRateLimitError(Exception):
+    """GitHub API のレートリミット超過。
+
+    黙って空リストを返すと「コミットなし」と区別できず空の日報が
+    生成されてしまうため、明示的にエラーとして伝播させる。
+    """
+
+
 def _http_get(url: str) -> tuple[int, dict, list | dict]:
     req = urllib.request.Request(url, headers=_headers())
     try:
@@ -70,6 +94,8 @@ def _http_get(url: str) -> tuple[int, dict, list | dict]:
             return resp.status, dict(resp.headers), data
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
+        if e.code in (403, 429) and "rate limit" in body.lower():
+            raise GitHubRateLimitError(f"GitHub API rate limit: {url}") from e
         logger.warning("GitHub API %s -> %s: %s", url, e.code, body[:200])
         return e.code, dict(e.headers), []
 
@@ -91,13 +117,8 @@ def fetch_commits_for_repo(
     ※ GitHub の commits API はデフォルトブランチしか返さないため、
       未マージのフィーチャーブランチ上の作業は branch 指定で個別に取得する必要がある。
     """
-    day = datetime.fromisoformat(date_iso).date()
-    since = datetime(day.year, day.month, day.day, 0, 0, 0, tzinfo=JST).isoformat()
-    until = (
-        datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=JST) + timedelta(seconds=1)
-    ).isoformat()
-
-    params = {"since": since, "until": until, "per_page": 100}
+    start, end = day_window(date_iso)
+    params = {"since": start.isoformat(), "until": end.isoformat(), "per_page": 100}
     if branch:
         params["sha"] = branch
     qs = urllib.parse.urlencode(params)
@@ -127,23 +148,69 @@ def fetch_commits_for_repo(
     return out
 
 
+def _discover_repos(pushed_since: datetime) -> list[str]:
+    """トークンでアクセス可能なリポのうち、対象期間以降に push があり
+    REPO_OWNERS 配下のものを自動発見する（新規リポの追従用）。"""
+    repos: list[str] = []
+    for page in range(1, 6):  # 最大500リポまで（pushed 降順なので通常1ページで打ち切り）
+        qs = urllib.parse.urlencode(
+            {
+                "per_page": 100,
+                "page": page,
+                "sort": "pushed",
+                "direction": "desc",
+                "affiliation": "owner,collaborator,organization_member",
+            }
+        )
+        status, _headers_, data = _http_get(f"{GITHUB_API}/user/repos?{qs}")
+        if status >= 400 or not isinstance(data, list) or not data:
+            break
+        reached_old = False
+        for r in data:
+            pushed_at = r.get("pushed_at")
+            if not pushed_at:
+                continue
+            if datetime.fromisoformat(pushed_at) < pushed_since:
+                reached_old = True
+                break
+            full_name = r.get("full_name", "")
+            if full_name.split("/")[0] in REPO_OWNERS:
+                repos.append(full_name)
+        if reached_old:
+            break
+    return repos
+
+
 def fetch_all_commits(date_iso: str, repos: list[str] | None = None) -> list[dict]:
     """対象日ぶんのコミットを全リポ・全ブランチ横断で返す（時刻昇順・SHA重複排除）。
 
-    GitHub の commits API はデフォルトブランチしか返さないため、
-    リポジトリごとにブランチを列挙して (repo, branch) 単位で並列取得する。
+    - GitHub の commits API はデフォルトブランチしか返さないため、
+      リポジトリごとにブランチを列挙して (repo, branch) 単位で並列取得する
+    - 対象リポは DEFAULT_REPOS に加えて、対象日以降に push のあった
+      REPO_OWNERS 配下のリポを自動発見して合流させる（新規リポの追従）
     """
     logins = _get_logins()
-    repos = repos or DEFAULT_REPOS
+    if repos is None:
+        start, _end = day_window(date_iso)
+        try:
+            discovered = _discover_repos(start)
+        except GitHubRateLimitError:
+            raise
+        except Exception as e:
+            logger.warning("repo discovery failed: %s", e)
+            discovered = []
+        repos = sorted(set(DEFAULT_REPOS) | set(discovered))
 
     def _branches(repo: str) -> list[str]:
         try:
             return _list_branches(repo)
+        except GitHubRateLimitError:
+            raise
         except Exception as e:
             logger.warning("skip branches %s: %s", repo, e)
             return []
 
-    with ThreadPoolExecutor(max_workers=min(16, len(repos)) or 1) as ex:
+    with ThreadPoolExecutor(max_workers=min(8, len(repos)) or 1) as ex:
         branch_lists = list(ex.map(_branches, repos))
 
     # ブランチ一覧が取れなかったリポはデフォルトブランチだけ対象にする (branch=None)
@@ -158,13 +225,15 @@ def fetch_all_commits(date_iso: str, repos: list[str] | None = None) -> list[dic
         repo, branch = task
         try:
             return fetch_commits_for_repo(repo, date_iso, logins, branch)
+        except GitHubRateLimitError:
+            raise
         except Exception as e:
             logger.warning("skip %s (%s): %s", repo, branch, e)
             return []
 
     all_commits: list[dict] = []
     seen: set[tuple[str, str]] = set()
-    with ThreadPoolExecutor(max_workers=16) as ex:
+    with ThreadPoolExecutor(max_workers=8) as ex:
         for result in ex.map(_one, tasks):
             for c in result:
                 key = (c["repo"], c["sha"])
