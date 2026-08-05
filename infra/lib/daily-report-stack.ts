@@ -54,10 +54,11 @@ export class DailyReportStack extends cdk.Stack {
 				),
 				architecture: lambda.Architecture.ARM_64,
 				memorySize: 512,
-				timeout: cdk.Duration.seconds(30),
+				// GitHub API 13 repo × 数百 ms + Bedrock + Calendar 全部直列で 30s では危ういので 60s
+				timeout: cdk.Duration.seconds(60),
 				environment: {
 					AWS_REGION_NAME: this.region,
-					BEDROCK_MODEL_ID: "apac.anthropic.claude-sonnet-4-20250514-v1:0",
+					BEDROCK_MODEL_ID: "global.anthropic.claude-sonnet-5",
 					TEMPLATE_BUCKET: templateBucket.bucketName,
 					TEMPLATE_KEY: "templates/業務日報テンプレート.docx",
 				},
@@ -75,6 +76,17 @@ export class DailyReportStack extends cdk.Stack {
 		// Lambda に S3 読み取り権限を付与
 		templateBucket.grantRead(backendFunction);
 
+		// Lambda に Secrets Manager 読み取り権限を付与
+		// (daily-report/github-auth と daily-report/google-oauth を対象)
+		backendFunction.addToRolePolicy(
+			new iam.PolicyStatement({
+				actions: ["secretsmanager:GetSecretValue"],
+				resources: [
+					`arn:aws:secretsmanager:${this.region}:${this.account}:secret:daily-report/*`,
+				],
+			}),
+		);
+
 		// ========================================
 		// API Gateway: REST API
 		// ========================================
@@ -84,7 +96,7 @@ export class DailyReportStack extends cdk.Stack {
 			defaultCorsPreflightOptions: {
 				allowOrigins: apigateway.Cors.ALL_ORIGINS,
 				allowMethods: apigateway.Cors.ALL_METHODS,
-				allowHeaders: ["Content-Type"],
+				allowHeaders: ["Content-Type", "X-Api-Token"],
 			},
 		});
 
@@ -109,11 +121,39 @@ export class DailyReportStack extends cdk.Stack {
 		// ========================================
 		// CloudFront: 統合ディストリビューション
 		// ========================================
+		// Next.js 静的エクスポートは /personal → personal.html を生成するため、
+		// 拡張子なし URI を .html に書き換える（S3 REST オリジンはディレクトリ解決しない）
+		const htmlRewriteFunction = new cloudfront.Function(
+			this,
+			"HtmlRewriteFunction",
+			{
+				runtime: cloudfront.FunctionRuntime.JS_2_0,
+				code: cloudfront.FunctionCode.fromInline(
+					[
+						"function handler(event) {",
+						"  var request = event.request;",
+						"  var uri = request.uri;",
+						"  if (uri !== '/' && !uri.includes('.')) {",
+						"    request.uri = uri.replace(/\\/+$/, '') + '.html';",
+						"  }",
+						"  return request;",
+						"}",
+					].join("\n"),
+				),
+			},
+		);
+
 		const distribution = new cloudfront.Distribution(this, "Distribution", {
 			defaultBehavior: {
 				origin: origins.S3BucketOrigin.withOriginAccessControl(frontendBucket),
 				viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
 				cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
+				functionAssociations: [
+					{
+						function: htmlRewriteFunction,
+						eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
+					},
+				],
 			},
 			additionalBehaviors: {
 				"/api/*": {
