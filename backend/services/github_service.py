@@ -74,15 +74,33 @@ def _http_get(url: str) -> tuple[int, dict, list | dict]:
         return e.code, dict(e.headers), []
 
 
-def fetch_commits_for_repo(repo: str, date_iso: str, logins: set[str]) -> list[dict]:
-    """1 リポジトリ・1 日ぶんのコミット (author in logins, no merges) を返す。"""
+def _list_branches(repo: str) -> list[str]:
+    """リポジトリのブランチ名一覧（最大100件）を返す。取得失敗時は空リスト。"""
+    status, _headers_, data = _http_get(f"{GITHUB_API}/repos/{repo}/branches?per_page=100")
+    if status >= 400 or not isinstance(data, list):
+        return []
+    return [b["name"] for b in data if isinstance(b, dict) and b.get("name")]
+
+
+def fetch_commits_for_repo(
+    repo: str, date_iso: str, logins: set[str], branch: str | None = None
+) -> list[dict]:
+    """1 リポジトリ・1 ブランチ・1 日ぶんのコミット (author in logins, no merges) を返す。
+
+    branch 未指定時はデフォルトブランチ。
+    ※ GitHub の commits API はデフォルトブランチしか返さないため、
+      未マージのフィーチャーブランチ上の作業は branch 指定で個別に取得する必要がある。
+    """
     day = datetime.fromisoformat(date_iso).date()
     since = datetime(day.year, day.month, day.day, 0, 0, 0, tzinfo=JST).isoformat()
     until = (
         datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=JST) + timedelta(seconds=1)
     ).isoformat()
 
-    qs = urllib.parse.urlencode({"since": since, "until": until, "per_page": 100})
+    params = {"since": since, "until": until, "per_page": 100}
+    if branch:
+        params["sha"] = branch
+    qs = urllib.parse.urlencode(params)
     url = f"{GITHUB_API}/repos/{repo}/commits?{qs}"
     status, _headers_, data = _http_get(url)
     if status == 404 or status == 409:  # empty repo / no access
@@ -110,25 +128,49 @@ def fetch_commits_for_repo(repo: str, date_iso: str, logins: set[str]) -> list[d
 
 
 def fetch_all_commits(date_iso: str, repos: list[str] | None = None) -> list[dict]:
-    """対象日ぶんのコミットを全リポ横断で返す（時刻昇順）。
+    """対象日ぶんのコミットを全リポ・全ブランチ横断で返す（時刻昇順・SHA重複排除）。
 
-    リポジトリごとの GitHub API 呼び出しはスレッドプールで並列化する。
+    GitHub の commits API はデフォルトブランチしか返さないため、
+    リポジトリごとにブランチを列挙して (repo, branch) 単位で並列取得する。
     """
     logins = _get_logins()
     repos = repos or DEFAULT_REPOS
-    all_commits: list[dict] = []
 
-    def _one(repo: str) -> list[dict]:
+    def _branches(repo: str) -> list[str]:
         try:
-            return fetch_commits_for_repo(repo, date_iso, logins)
+            return _list_branches(repo)
         except Exception as e:
-            logger.warning("skip repo %s: %s", repo, e)
+            logger.warning("skip branches %s: %s", repo, e)
             return []
 
-    max_workers = min(16, len(repos)) or 1
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for result in ex.map(_one, repos):
-            all_commits.extend(result)
+    with ThreadPoolExecutor(max_workers=min(16, len(repos)) or 1) as ex:
+        branch_lists = list(ex.map(_branches, repos))
+
+    # ブランチ一覧が取れなかったリポはデフォルトブランチだけ対象にする (branch=None)
+    tasks: list[tuple[str, str | None]] = []
+    for repo, branches in zip(repos, branch_lists):
+        if branches:
+            tasks.extend((repo, b) for b in branches)
+        else:
+            tasks.append((repo, None))
+
+    def _one(task: tuple[str, str | None]) -> list[dict]:
+        repo, branch = task
+        try:
+            return fetch_commits_for_repo(repo, date_iso, logins, branch)
+        except Exception as e:
+            logger.warning("skip %s (%s): %s", repo, branch, e)
+            return []
+
+    all_commits: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        for result in ex.map(_one, tasks):
+            for c in result:
+                key = (c["repo"], c["sha"])
+                if key not in seen:
+                    seen.add(key)
+                    all_commits.append(c)
 
     all_commits.sort(key=lambda c: c.get("date_iso") or "")
     return all_commits
